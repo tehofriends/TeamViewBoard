@@ -21,191 +21,75 @@ except Exception:
 
 st.set_page_config(page_title="Leadership Summary", layout="wide")
 # ---- Authentication (resilient to 0.3.x / 0.4.x behaviors) ----
-# ---- Authentication (with debug tools) ----
+# --- Simple password/username gate (no hashing) ---
 import os
 import streamlit as st
-import streamlit_authenticator as stauth
 from collections.abc import Mapping
 
-# bcrypt only used for the manual debug check
-try:
-    import bcrypt  # type: ignore
-except Exception:
-    bcrypt = None
-
-# Newer versions expose DeprecationError; make it optional
-try:
-    from streamlit_authenticator.utilities.exceptions import DeprecationError
-except Exception:
-    class DeprecationError(Exception):  # fallback
-        pass
-
 def _to_builtin(x):
-    if isinstance(x, Mapping): return {k: _to_builtin(v) for k, v in x.items()}
+    if isinstance(x, Mapping): return {k: _to_builtin(v) for k,v in x.items()}
     if isinstance(x, list):    return [_to_builtin(v) for v in x]
     return x
 
-def _with_email_aliases(creds: dict) -> dict:
-    """Allow username OR email to be used in the 'Username' field."""
-    out = {"usernames": {}}
-    for uname, rec in (creds.get("usernames") or {}).items():
-        out["usernames"][uname] = rec
-        email = (rec or {}).get("email")
-        if email and email not in out["usernames"]:
-            out["usernames"][email] = rec
-    return out
-
-def _find_user(creds: dict, typed: str):
-    """Get the credential record by username or email."""
-    users = (creds.get("usernames") or {})
-    if typed in users:
-        return users[typed]
-    # secondary scan for email match (if not using aliases)
-    for _, rec in users.items():
-        if isinstance(rec, dict) and rec.get("email") == typed:
-            return rec
-    return None
-
-def setup_auth():
+def require_simple_auth():
     """
-    Loads secrets, normalizes dicts (st.secrets is read-only),
-    and returns (authenticator, creds_for_debug).
+    Two modes (pick one via secrets):
+      A) Single shared password    -> [auth].passphrase
+      B) Username+password pairs   -> [auth.users]
+    If neither is set, auth is disabled.
     """
-    try:
-        creds  = _to_builtin(st.secrets["credentials"])
-        cookie = _to_builtin(st.secrets["cookie"])
-        pre    = _to_builtin(st.secrets.get("preauthorized", {})).get("emails", [])
-    except Exception:
-        st.warning("No secrets.toml found — authentication is DISABLED for this session.")
-        return None, {}
+    auth_cfg = _to_builtin(st.secrets.get("auth", {}))
+    passphrase = auth_cfg.get("passphrase") or os.environ.get("APP_PASSWORD")
+    users = auth_cfg.get("users")  # dict: {username: "plaintext"}
 
-    # sanity: require hashes
-    if "usernames" not in creds or not isinstance(creds["usernames"], dict):
-        st.error("secrets.toml → [credentials.usernames] is missing or malformed.")
-        st.stop()
-    for uname, rec in creds["usernames"].items():
-        if "password" not in rec or not str(rec["password"]).startswith("$2b$"):
-            st.error(f"User '{uname}' is missing a valid bcrypt hash. Fix secrets.toml.")
-            st.stop()
-
-    # allow login with email too
-    creds_alias = _with_email_aliases(creds)
-
-    cname = cookie.get("name")
-    ckey  = cookie.get("key")
-    cdays = int(cookie.get("expiry_days", 30))
-    if not cname or not ckey:
-        st.error("secrets.toml → [cookie] must include 'name' and 'key'.")
-        st.stop()
-
-    # Handle both 0.3.x (positional) and 0.4.x (keyword) signatures
-    try:
-        authenticator = stauth.Authenticate(creds_alias, cname, ckey, cdays, pre)
-    except TypeError:
-        authenticator = stauth.Authenticate(
-            credentials=creds_alias,
-            cookie_name=cname,
-            key=ckey,
-            cookie_expiry_days=cdays,
-            preauthorized=pre,
-        )
-    return authenticator, creds_alias
-
-def auth_login(authenticator):
-    """
-    Normalizes return across stauth 0.3.x / 0.4.x.
-    """
-    if authenticator is None:
-        # Dev bypass: let you see the app if secrets aren’t loaded
-        return ("developer", True, "dev-user")
-
-    try:
-        res = authenticator.login(
-            fields={
-                "Form name": "Login",
-                "Username": "Username or Email",
-                "Password": "Password",
-                "Login": "Login",
-            },
-            location="main",
-            key="auth",                 # stable form key
-            clear_on_submit=True,       # avoids stale values
-            max_login_attempts=5,
-            single_session=False,
-        )
-    except (DeprecationError, TypeError):
-        # Fallback for older API
-        res = authenticator.login("Login", "main")
-
-    # Normalize return
-    if res is None:
-        return (None, None, None)  # first render
-    if isinstance(res, (list, tuple)) and len(res) == 3:
-        return res
-    if isinstance(res, dict):
-        return (res.get("name"), res.get("authentication_status"), res.get("username"))
-    return (None, None, None)
-
-def show_auth_debug(creds_for_debug: dict):
-    """
-    Sidebar debug panel to verify secrets are loaded and your password matches
-    the stored hash. TURN OFF after debugging!
-    """
-    # Enable with a checkbox (or set env DEBUG_AUTH=1)
-    enable = os.getenv("DEBUG_AUTH") == "1" or st.sidebar.checkbox("🔎 Debug authentication", value=False)
-    if not enable:
-        return
-
-    st.sidebar.markdown("**Loaded users (keys):**")
-    st.sidebar.code(list((creds_for_debug.get("usernames") or {}).keys()))
-
-    # Manual password check (bcrypt)
-    if bcrypt is None:
-        st.sidebar.warning("Install bcrypt to use manual password check: `pip install bcrypt`")
-        return
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Manual password check (temporary)**")
-    dbg_user = st.sidebar.text_input("Username or Email (debug)", key="dbg_user")
-    dbg_pass = st.sidebar.text_input("Password (debug)", type="password", key="dbg_pass")
-
-    if st.sidebar.button("Check password (debug)"):
-        rec = _find_user(creds_for_debug, dbg_user)
-        if not rec:
-            st.sidebar.error("User not found in secrets.")
-        else:
-            stored = str(rec.get("password", ""))
-            try:
-                ok = bcrypt.checkpw(dbg_pass.encode("utf-8"), stored.encode("utf-8"))
-                if ok:
-                    st.sidebar.success("✅ Password matches the stored hash.")
-                else:
-                    st.sidebar.error("❌ Password does NOT match the stored hash.")
-            except Exception as e:
-                st.sidebar.error(f"bcrypt error: {e}")
-
-# ---- boot authentication ----
-authenticator, _creds_debug = setup_auth()
-show_auth_debug(_creds_debug)             # <- toggle in sidebar to debug secrets/hashes
-name, auth_status, username = auth_login(authenticator)
-
-# Enforce login (when authenticator is active)
-if authenticator is not None:
-    if auth_status is False:
-        st.error("Username/password is incorrect.")
-        st.stop()
-    elif auth_status is None:
-        st.info("Please log in.")
-        st.stop()
-    else:
-        # First successful login: clean rerun to hide form
-        if not st.session_state.get("_logged_in_once"):
-            st.session_state["_logged_in_once"] = True
-            st.rerun()
-        # Logout in sidebar
+    # Already authenticated?
+    if st.session_state.get("auth_ok"):
         with st.sidebar:
-            authenticator.logout("Logout", "sidebar")
-            st.caption(f"Signed in as **{name}**")
+            user = st.session_state.get("auth_user", "member")
+            st.caption(f"Signed in as **{user}**")
+            if st.button("Logout"):
+                for k in ("auth_ok","auth_user"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+        return True
+
+    # Username + password mode
+    if isinstance(users, dict) and users:
+        st.header("Login")
+        with st.form("login_form", clear_on_submit=False):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            ok = st.form_submit_button("Login")
+        if ok:
+            if u in users and str(p) == str(users[u]):
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_user"] = u
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+        st.stop()
+
+    # Single-passphrase mode
+    if passphrase:
+        st.header("Restricted")
+        with st.form("pw_gate"):
+            p = st.text_input("Access password", type="password")
+            ok = st.form_submit_button("Enter")
+        if ok:
+            if str(p) == str(passphrase):
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_user"] = "member"
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        st.stop()
+
+    # If no secrets configured, auth is disabled
+    st.warning("Auth disabled (no [auth] secrets set).")
+    return True
+
+# Require auth before showing the rest of the app:
+require_simple_auth()
 
 # --- Uniform layout for metric cards + full-width buttons ---
 st.markdown("""
