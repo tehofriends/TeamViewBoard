@@ -28,15 +28,23 @@ from collections.abc import Mapping
 try:
     from streamlit_authenticator.utilities.exceptions import DeprecationError
 except Exception:
-    class DeprecationError(Exception):  # fallback for older versions
-        pass
+    class DeprecationError(Exception): pass
 
 def _to_builtin(x):
-    if isinstance(x, Mapping):
-        return {k: _to_builtin(v) for k, v in x.items()}
-    if isinstance(x, list):
-        return [_to_builtin(v) for v in x]
+    if isinstance(x, Mapping): return {k:_to_builtin(v) for k,v in x.items()}
+    if isinstance(x, list):    return [_to_builtin(v) for v in x]
     return x
+
+def _with_email_aliases(creds: dict) -> dict:
+    """Allow login by username OR email by cloning entries under the email key."""
+    out = {"usernames": {}}
+    src = creds.get("usernames", {})
+    for uname, rec in src.items():
+        out["usernames"][uname] = rec
+        email = (rec or {}).get("email")
+        if email and email not in out["usernames"]:
+            out["usernames"][email] = rec  # alias: login using email works too
+    return out
 
 def setup_auth():
     try:
@@ -47,47 +55,52 @@ def setup_auth():
         st.warning("No secrets.toml found — authentication is disabled for this session.")
         return None
 
+    # sanity checks
+    if "usernames" not in creds or not isinstance(creds["usernames"], dict):
+        st.error("secrets.toml: [credentials.usernames] is missing or malformed.")
+        st.stop()
+    for k, rec in creds["usernames"].items():
+        if "password" not in rec or not str(rec["password"]).startswith("$2b$"):
+            st.error(f"User '{k}' is missing a valid bcrypt hash. See the setup steps.")
+            st.stop()
+
+    creds = _with_email_aliases(creds)  # allow email login
+
     cname = cookie.get("name"); ckey = cookie.get("key"); cdays = int(cookie.get("expiry_days", 30))
     if not cname or not ckey:
-        st.error("Secrets missing cookie.name or cookie.key"); st.stop()
+        st.error("secrets.toml: [cookie] must include 'name' and 'key'.")
+        st.stop()
 
     try:
-        return stauth.Authenticate(creds, cname, ckey, cdays, pre)        # old signature
+        return stauth.Authenticate(creds, cname, ckey, cdays, pre)  # old signature
     except TypeError:
-        return stauth.Authenticate(                                      # new signature
+        return stauth.Authenticate(
             credentials=creds, cookie_name=cname, key=ckey,
             cookie_expiry_days=cdays, preauthorized=pre,
         )
 
 def auth_login(authenticator):
-    """Always return (name, auth_status, username)."""
     if authenticator is None:
-        return ("developer", True, "dev-user")  # dev mode without secrets
-
-    # Try new API first
+        return ("developer", True, "dev-user")  # dev mode: bypass when no secrets
     try:
         res = authenticator.login(
             fields={
                 "Form name": "Login",
-                "Username": "Username",
+                "Username": "Username or Email",
                 "Password": "Password",
                 "Login": "Login",
             },
             location="main",
         )
     except (DeprecationError, TypeError):
-        # Old API
         res = authenticator.login("Login", "main")
 
-    # Normalize various shapes:
-    if res is None:
-        # Most libs return None before the form is submitted
+    if res is None:                # first render before submit
         return (None, None, None)
     if isinstance(res, (list, tuple)) and len(res) == 3:
         return res
     if isinstance(res, dict):
         return (res.get("name"), res.get("authentication_status"), res.get("username"))
-    # Fallback
     return (None, None, None)
 
 authenticator = setup_auth()
@@ -95,14 +108,20 @@ name, auth_status, username = auth_login(authenticator)
 
 if authenticator is not None:
     if auth_status is False:
-        st.error("Username/password is incorrect."); st.stop()
+        st.error("Username/password is incorrect.")
+        st.stop()
     elif auth_status is None:
-        # Form is displayed; just stop rendering the rest of the app.
-        st.info("Please log in."); st.stop()
-    # Success:
-    with st.sidebar:
-        authenticator.logout("Logout", "sidebar")
-        st.caption(f"Signed in as **{name}**")
+        st.info("Please log in.")
+        st.stop()
+    else:
+        # Sometimes a clean rerun helps show the post-login state immediately
+        if not st.session_state.get("_logged_in_once"):
+            st.session_state["_logged_in_once"] = True
+            st.rerun()
+        with st.sidebar:
+            authenticator.logout("Logout", "sidebar")
+            st.caption(f"Signed in as **{name}**")
+
 
 # --- Uniform layout for metric cards + full-width buttons ---
 st.markdown("""
