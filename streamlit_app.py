@@ -89,24 +89,33 @@ def setup_auth():
 
 import inspect
 
+def _pick_state_value(suffix: str, default=None):
+    # Find first session_state key that ends with the suffix (handles prefixed keys)
+    for k, v in st.session_state.items():
+        if k.endswith(suffix):
+            return v
+    return default
+
 def auth_login(authenticator):
     """
-    Calls streamlit-authenticator login() with the correct signature by
-    inspecting its parameters at runtime, and normalizes the result.
+    Robust login that works for both 0.3.x and 0.4.x:
+    - Detects the signature at runtime
+    - Uses a fixed key="auth"
+    - Falls back to st.session_state if login() returns None
+    - Normalizes to (name, status, username)
     """
     if authenticator is None:
-        return ("developer", True, "dev-user")  # dev mode / no secrets
+        return ("developer", True, "dev-user")  # dev mode when no secrets
 
-    # Detect the expected parameters
+    # Detect parameters
     try:
-        sig = inspect.signature(authenticator.login)
-        params = set(sig.parameters.keys())
+        params = set(inspect.signature(authenticator.login).parameters.keys())
     except Exception:
         params = set()
 
+    # Call appropriate API
     try:
-        if "fields" in params:
-            # New API (0.4.x)
+        if "fields" in params:  # 0.4.x
             raw = authenticator.login(
                 fields={
                     "Form name": "Login",
@@ -115,30 +124,37 @@ def auth_login(authenticator):
                     "Login": "Login",
                 },
                 location="main",
+                key="auth",  # ensures consistent session_state keys
             )
-        else:
-            # Old API (0.3.x)
+        else:  # 0.3.x
             raw = authenticator.login("Login", "main")
     except Exception as e:
         st.error("Authentication error while calling login()")
         st.exception(e)
         return (None, None, None)
 
-    # Normalize return value to (name, status, username)
+    # Normalize possible return shapes
     name = status = user = None
-    if raw is None:
-        pass  # first render or not submitted yet
-    elif isinstance(raw, (list, tuple)) and len(raw) == 3:
+    if isinstance(raw, (list, tuple)) and len(raw) == 3:
         name, status, user = raw
     elif isinstance(raw, dict):
         name   = raw.get("name")
         status = raw.get("authentication_status")
         user   = raw.get("username")
 
-    # Debug info (collapse when you’re done)
+    # Fallback to session_state if still None (0.4.x behavior)
+    if status is None:
+        status = _pick_state_value("authentication_status", None)
+    if user is None:
+        user = _pick_state_value("username", None)
+    if name is None:
+        name = _pick_state_value("name", None)
+
+    # Debug (collapse when you’re done)
     with st.expander("Auth debug", expanded=False):
         st.write("login() params detected:", params)
         st.write("login() raw result:", raw)
+        st.write("session_state keys:", list(st.session_state.keys()))
         st.write("normalized:", {"name": name, "status": status, "username": user})
 
     return (name, status, user)
@@ -155,12 +171,14 @@ if authenticator is not None:
         st.info("Please log in.")
         st.stop()
     else:
+        # ensure UI flips immediately after successful login
         if not st.session_state.get("_logged_in_once"):
             st.session_state["_logged_in_once"] = True
             st.rerun()
         with st.sidebar:
             authenticator.logout("Logout", "sidebar")
             st.caption(f"Signed in as **{name}**")
+
 
 
 # --- Uniform layout for metric cards + full-width buttons ---
