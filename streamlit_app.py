@@ -87,19 +87,27 @@ def setup_auth():
             preauthorized=pre,
         )
 
-def auth_login(authenticator):
-    if authenticator is None:
-        # dev mode (no secrets configured)
-        return ("developer", True, "dev-user")
+import inspect
 
-    # Decide which signature to call based on installed version
-    ver = getattr(stauth, "__version__", "0.0.0")
-    major_minor = tuple(int(p) for p in ver.split(".")[:2] if p.isdigit())
+def auth_login(authenticator):
+    """
+    Calls streamlit-authenticator login() with the correct signature by
+    inspecting its parameters at runtime, and normalizes the result.
+    """
+    if authenticator is None:
+        return ("developer", True, "dev-user")  # dev mode / no secrets
+
+    # Detect the expected parameters
+    try:
+        sig = inspect.signature(authenticator.login)
+        params = set(sig.parameters.keys())
+    except Exception:
+        params = set()
 
     try:
-        if major_minor >= (0, 4):
-            # New API: returns (name, authentication_status, username)
-            res = authenticator.login(
+        if "fields" in params:
+            # New API (0.4.x)
+            raw = authenticator.login(
                 fields={
                     "Form name": "Login",
                     "Username": "Username or Email",
@@ -109,31 +117,33 @@ def auth_login(authenticator):
                 location="main",
             )
         else:
-            # Old API: returns tuple directly
-            res = authenticator.login("Login", "main")
-    except (DeprecationError, TypeError):
-        # Fallback to old signature if the new one throws
-        res = authenticator.login("Login", "main")
+            # Old API (0.3.x)
+            raw = authenticator.login("Login", "main")
+    except Exception as e:
+        st.error("Authentication error while calling login()")
+        st.exception(e)
+        return (None, None, None)
 
-    # Normalize result to (name, status, username)
+    # Normalize return value to (name, status, username)
     name = status = user = None
-    if res is None:
-        pass  # first render or submit not processed
-    elif isinstance(res, (list, tuple)) and len(res) == 3:
-        name, status, user = res
-    elif isinstance(res, dict):
-        name = res.get("name")
-        status = res.get("authentication_status")
-        user = res.get("username")
+    if raw is None:
+        pass  # first render or not submitted yet
+    elif isinstance(raw, (list, tuple)) and len(raw) == 3:
+        name, status, user = raw
+    elif isinstance(raw, dict):
+        name   = raw.get("name")
+        status = raw.get("authentication_status")
+        user   = raw.get("username")
 
-    # Debug box — collapse in production
+    # Debug info (collapse when you’re done)
     with st.expander("Auth debug", expanded=False):
-        st.write("streamlit-authenticator version:", ver)
-        st.write("login() raw result:", res)
+        st.write("login() params detected:", params)
+        st.write("login() raw result:", raw)
         st.write("normalized:", {"name": name, "status": status, "username": user})
 
     return (name, status, user)
 
+# Instantiate authenticator as you already do:
 authenticator = setup_auth()
 name, auth_status, username = auth_login(authenticator)
 
@@ -145,7 +155,6 @@ if authenticator is not None:
         st.info("Please log in.")
         st.stop()
     else:
-        # Make sure the post-login state shows immediately
         if not st.session_state.get("_logged_in_once"):
             st.session_state["_logged_in_once"] = True
             st.rerun()
