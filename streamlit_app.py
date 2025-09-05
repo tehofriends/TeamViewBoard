@@ -21,6 +21,7 @@ except Exception:
 
 st.set_page_config(page_title="Leadership Summary", layout="wide")
 # ---- Authentication (resilient to 0.3.x / 0.4.x behaviors) ----
+# ---- Authentication (robust for 0.3.x / 0.4.x) ----
 import streamlit as st
 import streamlit_authenticator as stauth
 from collections.abc import Mapping
@@ -28,7 +29,8 @@ from collections.abc import Mapping
 try:
     from streamlit_authenticator.utilities.exceptions import DeprecationError
 except Exception:
-    class DeprecationError(Exception): pass
+    class DeprecationError(Exception):  # 0.3.x fallback
+        pass
 
 def _to_builtin(x):
     if isinstance(x, Mapping): return {k:_to_builtin(v) for k,v in x.items()}
@@ -36,17 +38,17 @@ def _to_builtin(x):
     return x
 
 def _with_email_aliases(creds: dict) -> dict:
-    """Allow login by username OR email by cloning entries under the email key."""
+    """Allow login by username OR email."""
     out = {"usernames": {}}
-    src = creds.get("usernames", {})
-    for uname, rec in src.items():
+    for uname, rec in (creds.get("usernames") or {}).items():
         out["usernames"][uname] = rec
         email = (rec or {}).get("email")
         if email and email not in out["usernames"]:
-            out["usernames"][email] = rec  # alias: login using email works too
+            out["usernames"][email] = rec
     return out
 
 def setup_auth():
+    # Load secrets safely (read-only)
     try:
         creds  = _to_builtin(st.secrets["credentials"])
         cookie = _to_builtin(st.secrets["cookie"])
@@ -55,53 +57,82 @@ def setup_auth():
         st.warning("No secrets.toml found — authentication is disabled for this session.")
         return None
 
-    # sanity checks
+    # Basic validation
     if "usernames" not in creds or not isinstance(creds["usernames"], dict):
         st.error("secrets.toml: [credentials.usernames] is missing or malformed.")
         st.stop()
-    for k, rec in creds["usernames"].items():
-        if "password" not in rec or not str(rec["password"]).startswith("$2b$"):
-            st.error(f"User '{k}' is missing a valid bcrypt hash. See the setup steps.")
-            st.stop()
+    bad = [u for u, r in creds["usernames"].items() if not str(r.get("password","")).startswith("$2b$")]
+    if bad:
+        st.error(f"These users have missing/invalid bcrypt hashes: {', '.join(bad)}")
+        st.stop()
 
-    creds = _with_email_aliases(creds)  # allow email login
+    creds = _with_email_aliases(creds)
 
-    cname = cookie.get("name"); ckey = cookie.get("key"); cdays = int(cookie.get("expiry_days", 30))
+    cname = cookie.get("name")
+    ckey  = cookie.get("key")
+    cdays = int(cookie.get("expiry_days", 30))
     if not cname or not ckey:
         st.error("secrets.toml: [cookie] must include 'name' and 'key'.")
         st.stop()
 
+    # Instantiation: try old positional first (0.3.x), then new keywords (0.4.x)
     try:
-        return stauth.Authenticate(creds, cname, ckey, cdays, pre)  # old signature
+        return stauth.Authenticate(creds, cname, ckey, cdays, pre)
     except TypeError:
         return stauth.Authenticate(
-            credentials=creds, cookie_name=cname, key=ckey,
-            cookie_expiry_days=cdays, preauthorized=pre,
+            credentials=creds,
+            cookie_name=cname,
+            key=ckey,
+            cookie_expiry_days=cdays,
+            preauthorized=pre,
         )
 
 def auth_login(authenticator):
     if authenticator is None:
-        return ("developer", True, "dev-user")  # dev mode: bypass when no secrets
+        # dev mode (no secrets configured)
+        return ("developer", True, "dev-user")
+
+    # Decide which signature to call based on installed version
+    ver = getattr(stauth, "__version__", "0.0.0")
+    major_minor = tuple(int(p) for p in ver.split(".")[:2] if p.isdigit())
+
     try:
-        res = authenticator.login(
-            fields={
-                "Form name": "Login",
-                "Username": "Username or Email",
-                "Password": "Password",
-                "Login": "Login",
-            },
-            location="main",
-        )
+        if major_minor >= (0, 4):
+            # New API: returns (name, authentication_status, username)
+            res = authenticator.login(
+                fields={
+                    "Form name": "Login",
+                    "Username": "Username or Email",
+                    "Password": "Password",
+                    "Login": "Login",
+                },
+                location="main",
+            )
+        else:
+            # Old API: returns tuple directly
+            res = authenticator.login("Login", "main")
     except (DeprecationError, TypeError):
+        # Fallback to old signature if the new one throws
         res = authenticator.login("Login", "main")
 
-    if res is None:                # first render before submit
-        return (None, None, None)
-    if isinstance(res, (list, tuple)) and len(res) == 3:
-        return res
-    if isinstance(res, dict):
-        return (res.get("name"), res.get("authentication_status"), res.get("username"))
-    return (None, None, None)
+    # Normalize result to (name, status, username)
+    name = status = user = None
+    if res is None:
+        pass  # first render or submit not processed
+    elif isinstance(res, (list, tuple)) and len(res) == 3:
+        name, status, user = res
+    elif isinstance(res, dict):
+        name = res.get("name")
+        status = res.get("authentication_status")
+        user = res.get("username")
+
+    # Debug box — collapse in production
+    with st.expander("Auth debug", expanded=False):
+        st.write("streamlit-authenticator version:", ver)
+        st.write("login() raw result:", res)
+        st.write("normalized:", {"name": name, "status": status, "username": user})
+
+    return (name, status, user)
 
 authenticator = setup_auth()
 name, auth_status, username = auth_login(authenticator)
@@ -114,7 +145,7 @@ if authenticator is not None:
         st.info("Please log in.")
         st.stop()
     else:
-        # Sometimes a clean rerun helps show the post-login state immediately
+        # Make sure the post-login state shows immediately
         if not st.session_state.get("_logged_in_once"):
             st.session_state["_logged_in_once"] = True
             st.rerun()
